@@ -14,7 +14,9 @@ Ulepszenia (każde da się wyłączyć w rl_config.py, żeby porównać w eksper
   - Double DQN (van Hasselt i in., 2016): akcję w celu wybiera sieć ucząca się, a ocenia ją sieć
     docelowa - zmniejsza systematyczne przeszacowanie wartości Q,
   - Dueling (Wang i in., 2016): osobne gałęzie V(s) i A(s,a) - patrz rl/networks.py,
-  - n-krokowe zwroty: szybsze propagowanie kary za wypadek - patrz rl/replay.py.
+  - n-krokowe zwroty: szybsze propagowanie kary za wypadek - patrz rl/replay.py,
+  - priorytetowy bufor powtórek (Schaul i in., 2016): częściej uczymy się na przejściach z dużym
+    błędem TD (wypadki, trudne miejsca) - patrz rl/replay.py: PrioritizedReplayBuffer.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from ..networks import QNetwork
-from ..replay import ReplayBuffer
+from ..replay import PrioritizedReplayBuffer, ReplayBuffer
 from ..schedules import linear
 from .base import Agent
 
@@ -38,6 +40,10 @@ class DQNAgent(Agent):
     def __init__(self, obs_dim: int, n_actions: int, cfg, seed: int = 0):
         super().__init__(obs_dim, n_actions, cfg, seed)
         torch.manual_seed(seed)
+        if cfg.torch_threads > 0:
+            # Mała sieć nie zyskuje na wielu wątkach, a wątki PyTorcha "kręcą się" na wszystkich rdzeniach
+            # i zabierają procesor grze (spadek FPS). 1 wątek = szybciej i gra płynna.
+            torch.set_num_threads(cfg.torch_threads)
         self.device = torch.device("cuda" if cfg.device == "auto" and torch.cuda.is_available()
                                    else ("cpu" if cfg.device == "auto" else cfg.device))
         self.online = QNetwork(obs_dim, n_actions, tuple(cfg.hidden), cfg.dueling).to(self.device)
@@ -45,7 +51,11 @@ class DQNAgent(Agent):
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
         self.optimizer = torch.optim.Adam(self.online.parameters(), lr=cfg.lr)
-        self.buffer = ReplayBuffer(cfg.buffer_size, obs_dim, cfg.gamma, cfg.n_step, self.rng)
+        if cfg.prioritized_replay:
+            self.buffer = PrioritizedReplayBuffer(cfg.buffer_size, obs_dim, cfg.gamma, cfg.n_step, self.rng,
+                                                  alpha=cfg.per_alpha, eps=cfg.per_eps)
+        else:
+            self.buffer = ReplayBuffer(cfg.buffer_size, obs_dim, cfg.gamma, cfg.n_step, self.rng)
 
         self.total_steps = 0     # kroki środowiska w treningu (od nich zależy epsilon)
         self.updates = 0         # kroki gradientowe
@@ -57,6 +67,11 @@ class DQNAgent(Agent):
     def epsilon(self) -> float:
         c = self.cfg
         return linear(c.epsilon_start, c.epsilon_end, c.epsilon_decay_steps, self.total_steps)
+
+    @property
+    def lr(self) -> float:
+        c = self.cfg
+        return linear(c.lr, c.lr_end, c.lr_decay_steps, self.total_steps)
 
     @torch.no_grad()
     def q_values(self, obs: np.ndarray) -> np.ndarray:
@@ -83,9 +98,19 @@ class DQNAgent(Agent):
         for _ in range(c.gradient_steps):
             self._update()
 
+    @property
+    def per_beta(self) -> float:
+        c = self.cfg
+        return linear(c.per_beta_start, 1.0, c.per_beta_steps, self.total_steps)
+
     def _update(self) -> None:
         c = self.cfg
-        obs, actions, returns, next_obs, discounts = self.buffer.sample(c.batch_size)
+        if c.prioritized_replay:
+            obs, actions, returns, next_obs, discounts, idx, weights = self.buffer.sample(c.batch_size, self.per_beta)
+        else:
+            obs, actions, returns, next_obs, discounts = self.buffer.sample(c.batch_size)
+            idx, weights = None, np.ones(c.batch_size, dtype=np.float32)
+        weights = torch.as_tensor(weights, device=self.device)
         obs = torch.as_tensor(obs, device=self.device)
         next_obs = torch.as_tensor(next_obs, device=self.device)
         actions = torch.as_tensor(actions, device=self.device)
@@ -102,7 +127,12 @@ class DQNAgent(Agent):
                 q_next = q_next_target.max(dim=1).values
             target = returns + discounts * q_next                              # discounts = 0 w stanie terminalnym
 
-        loss = F.smooth_l1_loss(q, target)                                     # strata Hubera
+        # strata Hubera; przy PER każda próbka ważona korektą importance sampling
+        loss = (weights * F.smooth_l1_loss(q, target, reduction="none")).mean()
+        if idx is not None:
+            self.buffer.update_priorities(idx, (target - q).detach().cpu().numpy())   # nowy błąd TD = nowy priorytet
+        for group in self.optimizer.param_groups:                              # malejący współczynnik uczenia
+            group["lr"] = self.lr
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.online.parameters(), c.grad_clip)
@@ -127,6 +157,7 @@ class DQNAgent(Agent):
         c = self.cfg
         parts = [f"DQN  sieć {self.obs_dim}->{'->'.join(map(str, c.hidden))}->{self.n_actions}",
                  "double" if c.double_dqn else "", "dueling" if c.dueling else "",
+                 f"PER(alpha={c.per_alpha})" if c.prioritized_replay else "",
                  f"n-step={c.n_step}", f"bufor {c.buffer_size:,}", f"urządzenie {self.device}"]
         return "  |  ".join(p for p in parts if p)
 

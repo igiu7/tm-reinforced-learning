@@ -65,7 +65,7 @@ def _raw_and_avg(ax, x, y, window, color, label):
     ax.plot(x, _moving_avg(y, window), color=color, linewidth=2, label=f"{label} (śr. z {window})")
 
 
-def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | None:
+def plot_training(csv_path: Path, out_path: Path, window: int = 20, where_last: int = 300) -> Path | None:
     rows = read_log(csv_path)
     train = [r for r in rows if r["mode"] == "train"]
     evals = [r for r in rows if r["mode"] == "eval"]
@@ -79,8 +79,13 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | No
     ep = col(train, "episode")
     ev_ep = col(evals, "episode") if evals else np.array([])
 
-    fig, axes = plt.subplots(4, 2, figsize=(15, 16), facecolor=SURFACE)
-    (ax_time, ax_prog), (ax_rew, ax_reason), (ax_speed, ax_eps), (ax_loss, ax_q) = axes
+    fig = plt.figure(figsize=(15, 20), facecolor=SURFACE)
+    gs = fig.add_gridspec(5, 2)
+    ax_time, ax_prog = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
+    ax_rew, ax_reason = fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])
+    ax_speed, ax_eps = fig.add_subplot(gs[2, 0]), fig.add_subplot(gs[2, 1])
+    ax_loss, ax_q = fig.add_subplot(gs[3, 0]), fig.add_subplot(gs[3, 1])
+    ax_where = fig.add_subplot(gs[4, :])
 
     # --- 1. czasy ukończenia --------------------------------------------------
     _style(ax_time, "Czas przejazdu (ukończone)", "czas [s]")
@@ -168,6 +173,28 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | No
         _raw_and_avg(ax_q, ep, q, window, SERIES[0], "Q")
         _legend(ax_q, loc="lower right")
 
+    # --- 9. gdzie kończą się nieudane przejazdy ---------------------------------
+    recent = [r for r in rows if r["episode"] > ep.max() - where_last and not r["finished"]]
+    _style(ax_where, f"Gdzie kończą się nieudane przejazdy (ostatnie {where_last} epizodów)",
+           "liczba przejazdów", xlabel="miejsce na trasie [% długości]")
+    if recent:
+        edges = np.arange(0, 102.5, 2.5)
+        bottom = np.zeros(len(edges) - 1)
+        for k, color in zip(REASONS, SERIES):
+            if k == "finish":
+                continue
+            vals = np.array([r["progress_pct"] for r in recent if r["reason"] == k])
+            if len(vals) == 0:
+                continue
+            counts, _ = np.histogram(vals, bins=edges)
+            ax_where.bar(edges[:-1], counts, width=2.5, bottom=bottom, align="edge", color=color,
+                         edgecolor=SURFACE, linewidth=1, label=REASON_LABELS[k])
+            bottom += counts
+        ax_where.set_xlim(0, 100)
+        _legend(ax_where, loc="upper left")
+    else:
+        _no_data(ax_where, "Brak nieudanych przejazdów w tym okresie")
+
     # --- podsumowanie ----------------------------------------------------------
     n_fin = sum(r["finished"] for r in train)
     best_all = min((r["race_time_ms"] for r in fin), default=None)
@@ -176,12 +203,12 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | No
     steps = int(train[-1]["total_steps"]) if train else 0
     summary = (f"{len(train)} epizodów treningowych ({steps:,} kroków)  ·  {n_fin} ukończonych  ·  "
                + (f"najlepszy czas {best_all / 1000:.2f} s" if best_all else "brak ukończonych"))
-    fig.suptitle("Przebieg treningu", x=0.01, y=0.995, ha="left", va="top", fontsize=15, color=INK,
+    fig.suptitle("Przebieg treningu", x=0.01, y=0.996, ha="left", va="top", fontsize=15, color=INK,
                  fontweight="bold")
-    fig.text(0.01, 0.975, f"{summary}  ·  czas treningu {duration}", ha="left", va="top", fontsize=10,
+    fig.text(0.01, 0.98, f"{summary}  ·  czas treningu {duration}", ha="left", va="top", fontsize=10,
              color=INK_2)
 
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=110, facecolor=SURFACE)
     plt.close(fig)

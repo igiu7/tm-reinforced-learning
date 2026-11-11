@@ -20,13 +20,15 @@ ENV = EnvConfig(
     game_speed=20.0,         # przyspieszenie gry podczas treningu (fizyka bez zmian)
     action_repeat=5,         # 5 ticków x 10 ms = decyzja co 50 ms
     max_episode_ms=120_000,  # limit czasu przejazdu; musi wyraźnie przekraczać czas jazdy wolnego agenta
-    max_deviation_m=15.0,    # koniec epizodu, gdy auto odjedzie tak daleko od linii (szybka kara za spadnięcie z drogi)
+    max_deviation_m=15.0,    # koniec epizodu, gdy auto odjedzie tak daleko od linii w poziomie
+    max_vertical_deviation_m=40.0,  # ...albo w pionie (spadnięcie z podwyższenia); skoki i zjazdy nie są karane
     no_progress_timeout_ms=3_000,  # koniec, gdy przez 3 s auto nie posunie się o no_progress_min_m
     no_progress_min_m=5.0,         # (ocieranie się o bandę, jazda w złą stronę) - oszczędza mnóstwo czasu
     crash_penalty=-10.0,
     checkpoint_bonus=10.0,
     finish_bonus=100.0,
-    lookahead_m=(10, 20, 30, 50, 80, 120),  # punkty linii przed autem podawane w obserwacji
+    # punkty linii przed autem w obserwacji; najdalsze ~3 s przy 270 km/h, żeby zdążyć przed zjazdem/podjazdem
+    lookahead_m=(10, 20, 30, 50, 80, 120, 170, 230),
 )
 PLAY_GAME_SPEED = 1.0        # prędkość gry w trybie jazdy pokazowej
 
@@ -59,13 +61,23 @@ class DQNConfig:
     dueling: bool = True         # osobne gałęzie V(s) i A(s,a)
     double_dqn: bool = True      # Double DQN: mniejsze przeszacowanie Q
     device: str = "auto"         # "auto" (GPU, jeśli jest), "cpu", "cuda"
+    torch_threads: int = 1       # wątki PyTorcha na CPU; więcej zabiera procesor grze (0 = domyślnie wszystkie)
 
     # cel uczenia
     gamma: float = 0.99          # dyskonto; decyzja co 50 ms -> horyzont ~ 1/(1-gamma) = 100 kroków = 5 s
     n_step: int = 3              # n-krokowe zwroty (1 = klasyczny DQN)
 
+    # priorytetowy bufor powtórek (PER)
+    prioritized_replay: bool = True   # False = zwykły bufor jednorodny (do porównania w eksperymentach)
+    per_alpha: float = 0.6            # siła priorytetów: 0 = losowanie jednorodne, 1 = w pełni wg błędu TD
+    per_beta_start: float = 0.4       # korekta importance sampling na starcie...
+    per_beta_steps: int = 300_000     # ...rośnie liniowo do 1.0 przez tyle kroków
+    per_eps: float = 1e-3             # minimalny priorytet (każde przejście ma szansę zostać wylosowane)
+
     # optymalizacja
-    lr: float = 2.5e-4           # współczynnik uczenia Adama
+    lr: float = 2.5e-4           # współczynnik uczenia Adama na starcie...
+    lr_end: float = 5e-5         # ...liniowo maleje do tej wartości (stabilniejsza polityka pod koniec)
+    lr_decay_steps: int = 300_000
     batch_size: int = 128
     buffer_size: int = 200_000   # pojemność bufora powtórek (przejść)
     learning_starts: int = 5_000 # ile przejść zebrać losowo, zanim ruszy uczenie
@@ -76,8 +88,8 @@ class DQNConfig:
 
     # eksploracja epsilon-greedy: liniowo od start do end przez decay_steps kroków środowiska
     epsilon_start: float = 1.0
-    epsilon_end: float = 0.05
-    epsilon_decay_steps: int = 150_000
+    epsilon_end: float = 0.02    # przy 260 km/h każda losowa akcja to ryzyko wypadku
+    epsilon_decay_steps: int = 60_000   # ~300-400 epizodów; przy 150k agent jeździł losowo do ~850. epizodu
 
 
 # Parametry każdego algorytmu z REGISTRY. Nowy algorytm = nowy wpis.

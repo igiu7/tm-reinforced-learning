@@ -39,7 +39,8 @@ class EnvConfig:
     no_progress_min_m: float = 5.0      # ...o co najmniej tyle metrów (np. ociera się o bandę albo cofa)
     min_height: float = 9.0             # wypadnięcie z mapy (stadion: ziemia ~9, dostosuj do mapy)
     reference_line: str | None = "reference_line.npy"
-    max_deviation_m: float = 30.0       # koniec epizodu, gdy auto odjedzie tak daleko od linii
+    max_deviation_m: float = 30.0       # koniec epizodu, gdy auto odjedzie tak daleko od linii (w poziomie)
+    max_vertical_deviation_m: float = 40.0  # ...albo tyle w pionie (spadnięcie z podwyższenia); skoki są OK
     lookahead_m: tuple = (10, 20, 30, 50, 80)  # punkty linii przed autem podawane w obserwacji
     checkpoint_bonus: float = 10.0
     finish_bonus: float = 100.0
@@ -76,9 +77,11 @@ class ReferenceLine:
     def reset(self):
         self.last_idx = 0
 
-    def project(self, pos: np.ndarray, window: int = 50) -> tuple[float, float]:
-        """Zwraca (przejechany dystans wzdłuż linii, odległość od linii). Szuka tylko blisko
-        poprzedniego indeksu, żeby nie przeskakiwać na inne fragmenty trasy, które się krzyżują."""
+    def project(self, pos: np.ndarray, window: int = 50) -> tuple[float, float, float]:
+        """Zwraca (przejechany dystans wzdłuż linii, odległość od linii w poziomie, w pionie).
+        Szuka tylko blisko poprzedniego indeksu, żeby nie przeskakiwać na inne fragmenty trasy,
+        które się krzyżują. Odległość jest rozbita na poziom/pion, bo na skokach i zjazdach auto
+        leci inną wysokością niż przy nagrywaniu linii, choć nadal jest na trasie."""
         lo = max(0, self.last_idx - 5)
         hi = min(len(self.points) - 1, self.last_idx + window)
         a = self.points[lo:hi]
@@ -91,7 +94,8 @@ class ReferenceLine:
         k = int(np.argmin(d))
         self.last_idx = lo + k
         progress = self.cum[lo + k] + t[k] * self.seg_len[lo + k]
-        return progress, float(d[k])
+        diff = pos - proj[k]
+        return progress, float(math.hypot(diff[0], diff[2])), float(abs(diff[1]))
 
     def point_at(self, dist: float) -> np.ndarray:
         dist = min(max(dist, 0.0), self.length)
@@ -99,6 +103,19 @@ class ReferenceLine:
         i = min(i, len(self.seg_len) - 1)
         t = (dist - self.cum[i]) / max(self.seg_len[i], 1e-9)
         return self.points[i] + t * (self.points[i + 1] - self.points[i])
+
+
+# Obserwacja (wektor float32), gdy istnieje linia referencyjna:
+#   [0:3]   prędkość w układzie auta (bok, góra, przód) / 100       [m/s]
+#   [3:5]   sin(pochylenie), sin(przechył)
+#   [5:9]   kontakt kół z podłożem (0/1)
+#   [9:12]  prędkość obrotu w układzie auta / 5                      [rad/s]
+#   [12:16] ostatnio wciśnięte klawisze: gaz, hamulec, lewo, prawo (0/1)
+#   potem dla każdej odległości z lookahead_m: bok / 100, przód / 100, wysokość / 50 punktu linii
+#           przed autem względem auta [m]
+#   [-1]    odległość od linii w poziomie / max_deviation_m
+OBS_BASE_DIM = 16
+OBS_PER_LOOKAHEAD = 3
 
 
 def actions_to_script(action_log: list) -> str:
@@ -145,7 +162,7 @@ class TrackmaniaEnv(gym.Env):
         else:
             print("[ENV] Brak linii referencyjnej -> nagroda za prędkość (nagraj ją: python record_line.py)")
 
-        obs_dim = 3 + 2 + 4 + ((2 * len(self.cfg.lookahead_m) + 1) if self.line else 0)
+        obs_dim = OBS_BASE_DIM + ((OBS_PER_LOOKAHEAD * len(self.cfg.lookahead_m) + 1) if self.line else 0)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
         if continuous:
             self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)  # steer, gas
@@ -187,6 +204,7 @@ class TrackmaniaEnv(gym.Env):
         else:
             keys = DISCRETE_ACTIONS[int(action)]
             self.action_log.append((self._last_t, keys))
+            self._last_keys = keys
             self.bridge.action(*keys)
         t, state = self._wait_step()
         return self._evaluate(state, t)
@@ -255,6 +273,7 @@ class TrackmaniaEnv(gym.Env):
         self.stuck_ms = 0
         self.action_log: list = []     # (race_time, (gas, brake, left, right)) dla skryptu powtórki
         self._last_t = 0
+        self._last_keys = DISCRETE_ACTIONS[0]
         if self.line:
             self.line.reset()
 
@@ -270,19 +289,27 @@ class TrackmaniaEnv(gym.Env):
         except Exception:
             wheels = [0.0, 0.0, 0.0, 0.0]
 
-        # --- obserwacja ---
+        try:
+            ang = np.array(state.dyna.current_state.angular_speed, dtype=np.float64)
+        except Exception:
+            ang = np.zeros(3)
+
+        # --- obserwacja (układ opisany przy OBS_BASE_DIM) ---
         obs = [
             *(_to_local(vel, yaw) / 100.0),     # prędkość w układzie auta
             math.sin(pitch), math.sin(roll),
             *wheels,
+            *(_to_local(ang, yaw) / 5.0),       # prędkość obrotu (m.in. czy auto zaczyna zarzucać)
+            *(float(k) for k in self._last_keys),  # ostatnio wciśnięte klawisze (gaz, hamulec, lewo, prawo)
         ]
-        dist_from_line = 0.0
+        dist_from_line = vert_from_line = 0.0
         progress = 0.0
         if self.line:
-            progress, dist_from_line = self.line.project(pos)
+            progress, dist_from_line, vert_from_line = self.line.project(pos)
             for d in self.cfg.lookahead_m:
-                p = self.line.point_at(progress + d)
-                obs.extend(_to_local(p - pos, yaw)[[0, 2]] / 100.0)  # (bok, przód) do punktu przed autem
+                side, up, fwd = _to_local(self.line.point_at(progress + d) - pos, yaw)
+                # (bok, przód) - zakręty; wysokość - zjazdy, podjazdy, skocznie przed autem
+                obs.extend((side / 100.0, fwd / 100.0, up / 50.0))
             obs.append(dist_from_line / self.cfg.max_deviation_m)
         obs = np.asarray(obs, dtype=np.float32)
 
@@ -318,7 +345,8 @@ class TrackmaniaEnv(gym.Env):
             elif pos[1] < self.cfg.min_height:
                 terminated, reason = True, "fell"
                 reward += self.cfg.crash_penalty
-            elif self.line and dist_from_line > self.cfg.max_deviation_m:
+            elif self.line and (dist_from_line > self.cfg.max_deviation_m
+                                or vert_from_line > self.cfg.max_vertical_deviation_m):
                 terminated, reason = True, "off_track"
                 reward += self.cfg.crash_penalty
             elif self.stuck_ms >= self.cfg.stuck_timeout_ms:
