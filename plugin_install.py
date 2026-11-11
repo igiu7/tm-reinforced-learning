@@ -45,7 +45,7 @@ def install_plugin(override_dir: str | None = None) -> bool:
         return False
     if not dest_dir.parent.exists() and override_dir is None:
         print(f"[WTYCZKA] Nie znaleziono folderu TMInterface ({dest_dir.parent}).\n"
-              "          Zainstaluj TMInterface 2 i uruchom grę raz, albo ustaw TMI_PLUGINS_DIR w ql_config.py.")
+              "          Zainstaluj TMInterface 2 i uruchom grę raz, albo ustaw TMI_PLUGINS_DIR w rl_config.py.")
         return False
 
     if dest.exists() and dest.read_bytes() == PLUGIN_SRC.read_bytes():
@@ -66,6 +66,6 @@ def install_plugin(override_dir: str | None = None) -> bool:
 
 
 if __name__ == "__main__":
-    from ql_config import TMI_PLUGINS_DIR
+    from rl_config import TMI_PLUGINS_DIR
 
     install_plugin(TMI_PLUGINS_DIR)

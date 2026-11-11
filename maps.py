@@ -5,7 +5,7 @@ Katalog danych per mapa:
       <nazwa>_<uid>/
         map.json               uid, nazwa, autor
         reference_line.npy     linia referencyjna tej mapy
-        runs/<run_name>/       trening: q_table.npz, episodes.csv, training_plots.png, config.txt
+        runs/<run_name>/       trening: agent.pt, best.pt, episodes.csv, training_plots.png, config.txt
 """
 
 from __future__ import annotations
@@ -73,10 +73,10 @@ class MapStore:
 
 
 def summarize_run(run_dir: Path) -> RunSummary:
-    """Krótki opis treningu z episodes.csv (bez wczytywania tablicy Q)."""
-    from qlearning.stats import read_log
+    """Krótki opis treningu z episodes.csv (bez wczytywania agenta)."""
+    from rl.stats import read_log
 
-    if not (run_dir / "q_table.npz").exists():
+    if not (run_dir / "agent.pt").exists():
         return RunSummary(exists=False)
     rows = read_log(run_dir / "episodes.csv")
     train = [r for r in rows if r["mode"] == "train"]

@@ -1,7 +1,7 @@
 """
 Nagrywa linię referencyjną trasy (TMInterface 2 + wtyczka RL Bridge): przejedź mapę sam,
 a skrypt co ~1 m zapisze pozycję auta. Po przekroczeniu mety zapisuje linię do katalogu mapy
-(maps/<mapa>/reference_line.npy). Zwykle uruchamiane z menu: python train_qlearning.py
+(maps/<mapa>/reference_line.npy). Zwykle uruchamiane z menu: python main.py
 
     python record_line.py [port]
 """

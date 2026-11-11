@@ -1,11 +1,11 @@
 """
-Menu Q-learningu dla Trackmanii (TMInterface 2 + wtyczka RL Bridge).
+Menu uczenia ze wzmocnieniem dla Trackmanii (TMInterface 2 + wtyczka RL Bridge).
 
-    python train_qlearning.py
+    python main.py
 
 Wykrywa mapę załadowaną w grze i pracuje tylko na danych tej mapy (maps/<mapa>/):
-nagranie linii referencyjnej, nowy trening, kontynuacja, jazda nauczonym agentem, wykresy.
-Parametry: ql_config.py
+nagranie linii referencyjnej, nowy trening, kontynuacja, jazda wyuczonym agentem, wykresy, duchy.
+Algorytm i parametry: rl_config.py
 """
 
 from __future__ import annotations
@@ -14,11 +14,11 @@ import dataclasses
 import importlib
 
 import ghosts
-import ql_config
+import rl_config
 from maps import MapStore, summarize_run
 from plugin_install import install_plugin
-from ql_config import CONFIG, TMI_PLUGINS_DIR, TMI_SCRIPTS_DIR
-from qlearning import Trainer
+from rl_config import CONFIG, TMI_PLUGINS_DIR, TMI_SCRIPTS_DIR
+from rl import Trainer
 from record_line import record_line
 from tm_env import TrackmaniaEnv
 from tmi2_bridge import BridgeError, MapInfo, TMI2Bridge
@@ -81,21 +81,22 @@ class App:
         self.bridge.sock = None
 
     def trainer(self, info: MapInfo) -> Trainer:
-        return Trainer(self.cfg, self.store.run_dir(info, self.cfg.train.run_name))
+        return Trainer(self.cfg, self.store.run_dir(info, self.cfg.run_name))
 
     # --- ekran główny ---------------------------------------------------------
     def status(self) -> dict:
         s = {"connected": self.bridge.connected, "map": self.map, "line": False, "run": None, "ghosts": 0}
         if self.map:
             s["line"] = self.store.has_line(self.map)
-            run_dir = self.store.map_dir(self.map) / "runs" / self.cfg.train.run_name
+            run_dir = self.store.map_dir(self.map) / "runs" / self.cfg.run_name
             run = summarize_run(run_dir)
             s["run"] = run if run.exists else None
             s["ghosts"] = len(ghosts.list_ghosts(run_dir))
         return s
 
     def print_header(self, s: dict) -> None:
-        print(f"\n{LINE}\n  TrackMania RL - Q-learning   (konfiguracja: ql_config.py, trening '{self.cfg.train.run_name}')\n{LINE}")
+        print(f"\n{LINE}\n  TrackMania RL - algorytm: {self.cfg.algorithm.upper()}   "
+              f"(konfiguracja: rl_config.py, trening '{self.cfg.run_name}')\n{LINE}")
         if not s["connected"]:
             print(f"Gra:    NIEPOŁĄCZONA - uruchom TMNF z TMInterface 2 i wtyczką RL Bridge (port {self.bridge.port})")
         else:
@@ -109,11 +110,11 @@ class App:
             r = s["run"]
             if r:
                 prog = f", ostatni postęp {r.last_progress_pct:.0f}%" if r.last_progress_pct is not None else ""
-                print(f"Trening '{self.cfg.train.run_name}': {r.train_episodes} epizodów, "
+                print(f"Trening '{self.cfg.run_name}': {r.train_episodes} epizodów, "
                       f"{r.finishes} ukończonych, najlepszy czas {fmt_time(r.best_ms)}{prog}")
                 print(f"Zapisane przejazdy do powtórek (duchy): {s['ghosts']}")
             else:
-                print(f"Trening '{self.cfg.train.run_name}': brak dla tej mapy")
+                print(f"Trening '{self.cfg.run_name}': brak dla tej mapy")
         print(LINE)
 
     def menu_items(self, s: dict):
@@ -125,7 +126,7 @@ class App:
             ("2", "Nowy trening (od zera, zaczyna od nagrania linii)", game, "wymaga gry z załadowaną mapą",
              self.do_new_training),
             ("3", "Kontynuuj trening", line and run, "brak treningu dla tej mapy", self.do_continue),
-            ("4", "Jazda nauczonym agentem", line and run, "brak treningu dla tej mapy", self.do_play),
+            ("4", "Jazda wyuczonym agentem", line and run, "brak treningu dla tej mapy", self.do_play),
             ("5", "Wykresy tej mapy", run, "brak treningu dla tej mapy", self.do_plot_current),
             ("6", "Wszystkie mapy z treningiem", True, "", self.do_list_maps),
             ("7", "Odśwież (połącz / wykryj mapę)", True, "", lambda: None),
@@ -135,12 +136,12 @@ class App:
         ]
 
     def reload_config(self) -> None:
-        """Wczytuje ql_config.py na nowo, żeby zmiany działały bez restartu menu."""
+        """Wczytuje rl_config.py na nowo, żeby zmiany działały bez restartu menu."""
         global TMI_SCRIPTS_DIR
         try:
-            module = importlib.reload(ql_config)
+            module = importlib.reload(rl_config)
         except Exception as e:  # noqa: BLE001 - błąd w pliku konfiguracji nie może zamknąć menu
-            print(f"[CONFIG] Błąd w ql_config.py - zostaję przy poprzednich ustawieniach: {e}")
+            print(f"[CONFIG] Błąd w rl_config.py - zostaję przy poprzednich ustawieniach: {e}")
             return
         self.cfg = module.CONFIG
         TMI_SCRIPTS_DIR = module.TMI_SCRIPTS_DIR
@@ -265,7 +266,7 @@ class App:
         info = self._current_map_unchanged()
         if not info:
             return
-        run_dir = self.store.run_dir(info, self.cfg.train.run_name)
+        run_dir = self.store.run_dir(info, self.cfg.run_name)
         all_ghosts = ghosts.list_ghosts(run_dir)
         records = ghosts.select_records(all_ghosts)
         print(f"\nUkończone przejazdy: {len(all_ghosts)}  (najlepszy {fmt_time(min(g.time_ms for g in all_ghosts))})")
@@ -303,7 +304,7 @@ class App:
     def do_list_maps(self) -> None:
         rows = []
         for info, d in self.store.known_maps():
-            run = summarize_run(d / "runs" / self.cfg.train.run_name)
+            run = summarize_run(d / "runs" / self.cfg.run_name)
             rows.append((info, d, run))
         if not rows:
             print("Brak zapisanych map. Nagraj linię referencyjną na jakiejś mapie (opcja 1).")
@@ -320,7 +321,7 @@ class App:
             if not run.exists:
                 print("Ta mapa nie ma jeszcze treningu.")
                 return
-            Trainer(self.cfg, d / "runs" / self.cfg.train.run_name).plot(open_file=True)
+            Trainer(self.cfg, d / "runs" / self.cfg.run_name).plot(open_file=True)
 
 
 def main():

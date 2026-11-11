@@ -1,4 +1,4 @@
-"""Wykresy przebiegu treningu z pliku episodes.csv."""
+"""Wykresy przebiegu treningu z pliku episodes.csv (wspólne dla wszystkich algorytmów)."""
 
 from __future__ import annotations
 
@@ -21,22 +21,28 @@ REASON_LABELS = {"finish": "meta", "off_track": "zjazd z trasy", "fell": "wypadn
 
 
 def _moving_avg(y: np.ndarray, w: int) -> np.ndarray:
+    """Średnia krocząca ignorująca braki danych (nan)."""
+    y = np.asarray(y, dtype=float)
     if len(y) == 0:
         return y
     w = max(1, min(w, len(y)))
-    c = np.cumsum(np.insert(y.astype(float), 0, 0.0))
-    out = np.empty(len(y))
+    valid = ~np.isnan(y)
+    c = np.cumsum(np.insert(np.where(valid, y, 0.0), 0, 0.0))
+    n = np.cumsum(np.insert(valid.astype(float), 0, 0.0))
+    out = np.full(len(y), np.nan)
     for i in range(len(y)):
         lo = max(0, i - w + 1)
-        out[i] = (c[i + 1] - c[lo]) / (i + 1 - lo)
+        cnt = n[i + 1] - n[lo]
+        if cnt > 0:
+            out[i] = (c[i + 1] - c[lo]) / cnt
     return out
 
 
-def _style(ax, title: str, ylabel: str):
+def _style(ax, title: str, ylabel: str, xlabel: str = "epizod"):
     ax.set_facecolor(SURFACE)
     ax.set_title(title, loc="left", fontsize=11, color=INK, fontweight="bold", pad=8)
     ax.set_ylabel(ylabel, color=INK_2, fontsize=9)
-    ax.set_xlabel("epizod", color=INK_2, fontsize=9)
+    ax.set_xlabel(xlabel, color=INK_2, fontsize=9)
     ax.grid(True, color=GRID, linewidth=0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
@@ -47,12 +53,16 @@ def _style(ax, title: str, ylabel: str):
 
 
 def _legend(ax, **kw):
-    leg = ax.legend(frameon=False, fontsize=8, labelcolor=INK_2, **kw)
-    return leg
+    return ax.legend(frameon=False, fontsize=8, labelcolor=INK_2, **kw)
 
 
 def _no_data(ax, text: str):
     ax.text(0.5, 0.5, text, transform=ax.transAxes, ha="center", va="center", color=INK_2, fontsize=9)
+
+
+def _raw_and_avg(ax, x, y, window, color, label):
+    ax.plot(x, y, color=color, alpha=0.25, linewidth=1)
+    ax.plot(x, _moving_avg(y, window), color=color, linewidth=2, label=f"{label} (śr. z {window})")
 
 
 def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | None:
@@ -64,13 +74,13 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | No
         return None
 
     def col(rs, k):
-        return np.array([r[k] for r in rs])
+        return np.array([r[k] for r in rs], dtype=float)
 
     ep = col(train, "episode")
     ev_ep = col(evals, "episode") if evals else np.array([])
 
-    fig, axes = plt.subplots(3, 2, figsize=(15, 12), facecolor=SURFACE)
-    (ax_time, ax_prog), (ax_rew, ax_reason), (ax_speed, ax_expl) = axes
+    fig, axes = plt.subplots(4, 2, figsize=(15, 16), facecolor=SURFACE)
+    (ax_time, ax_prog), (ax_rew, ax_reason), (ax_speed, ax_eps), (ax_loss, ax_q) = axes
 
     # --- 1. czasy ukończenia --------------------------------------------------
     _style(ax_time, "Czas przejazdu (ukończone)", "czas [s]")
@@ -84,14 +94,14 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | No
         if fev:
             ax_time.scatter(col(fev, "episode"), col(fev, "race_time_ms") / 1000, s=40, color=SERIES[1],
                             edgecolors=SURFACE, linewidths=1.5, zorder=3, label="test (bez eksploracji)")
-        # najlepszy czas do danego momentu
-        fin_sorted = sorted(fin, key=lambda r: (r["episode"], r["mode"]))
         best, bx, by = None, [], []
-        for r in fin_sorted:
+        for r in sorted(fin, key=lambda r: (r["episode"], r["mode"])):
             t = r["race_time_ms"] / 1000
             best = t if best is None else min(best, t)
-            bx.append(r["episode"]); by.append(best)
-        bx.append(max(ep.max(), bx[-1])); by.append(best)
+            bx.append(r["episode"])
+            by.append(best)
+        bx.append(max(ep.max(), bx[-1]))
+        by.append(best)
         ax_time.step(bx, by, where="post", color=INK, linewidth=2, label="najlepszy dotąd")
         ax_time.annotate(f"{best:.2f} s", (bx[-1], best), xytext=(-4, -12), textcoords="offset points",
                          ha="right", color=INK, fontsize=9, fontweight="bold")
@@ -101,9 +111,7 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | No
 
     # --- 2. postęp trasy -------------------------------------------------------
     _style(ax_prog, "Przejechana część trasy", "postęp [%]")
-    prog = col(train, "progress_pct")
-    ax_prog.plot(ep, prog, color=SERIES[0], alpha=0.25, linewidth=1)
-    ax_prog.plot(ep, _moving_avg(prog, window), color=SERIES[0], linewidth=2, label=f"trening (śr. z {window})")
+    _raw_and_avg(ax_prog, ep, col(train, "progress_pct"), window, SERIES[0], "trening")
     if evals:
         ax_prog.plot(ev_ep, col(evals, "progress_pct"), color=SERIES[1], linewidth=2, marker="o",
                      markersize=5, markeredgecolor=SURFACE, label="test")
@@ -112,9 +120,7 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | No
 
     # --- 3. nagroda ------------------------------------------------------------
     _style(ax_rew, "Suma nagród w epizodzie", "nagroda")
-    rew = col(train, "reward")
-    ax_rew.plot(ep, rew, color=SERIES[0], alpha=0.25, linewidth=1)
-    ax_rew.plot(ep, _moving_avg(rew, window), color=SERIES[0], linewidth=2, label=f"trening (śr. z {window})")
+    _raw_and_avg(ax_rew, ep, col(train, "reward"), window, SERIES[0], "trening")
     if evals:
         ax_rew.plot(ev_ep, col(evals, "reward"), color=SERIES[1], linewidth=2, marker="o",
                     markersize=5, markeredgecolor=SURFACE, label="test")
@@ -140,26 +146,43 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20) -> Path | No
     _legend(ax_speed, loc="lower right")
 
     # --- 6. eksploracja --------------------------------------------------------
-    _style(ax_expl, "Eksploracja", "%")
-    ax_expl.plot(ep, col(train, "epsilon") * 100, color=SERIES[0], linewidth=2, label="epsilon (losowe akcje)")
-    ax_expl.plot(ep, col(train, "visited_states_pct"), color=SERIES[2], linewidth=2,
-                 label="odwiedzone stany tablicy Q")
-    ax_expl.set_ylim(0, 105)
-    _legend(ax_expl, loc="center right")
+    _style(ax_eps, "Eksploracja: udział losowych akcji (epsilon)", "epsilon")
+    ax_eps.plot(ep, col(train, "epsilon"), color=SERIES[0], linewidth=2)
+    ax_eps.set_ylim(0, 1.02)
+
+    # --- 7. strata uczenia -----------------------------------------------------
+    loss = col(train, "loss")
+    _style(ax_loss, "Strata uczenia (Huber)", "loss")
+    if np.isnan(loss).all():
+        _no_data(ax_loss, "Brak aktualizacji sieci (bufor jeszcze się zapełnia)")
+    else:
+        _raw_and_avg(ax_loss, ep, loss, window, SERIES[0], "strata")
+        _legend(ax_loss, loc="upper right")
+
+    # --- 8. średnie Q ----------------------------------------------------------
+    q = col(train, "q_mean")
+    _style(ax_q, "Średnia przewidywana wartość Q", "Q")
+    if np.isnan(q).all():
+        _no_data(ax_q, "Brak aktualizacji sieci (bufor jeszcze się zapełnia)")
+    else:
+        _raw_and_avg(ax_q, ep, q, window, SERIES[0], "Q")
+        _legend(ax_q, loc="lower right")
 
     # --- podsumowanie ----------------------------------------------------------
     n_fin = sum(r["finished"] for r in train)
     best_all = min((r["race_time_ms"] for r in fin), default=None)
     secs = sum(r["wall_time_s"] for r in rows)
     duration = f"{secs / 3600:.1f} h" if secs >= 3600 else f"{secs / 60:.0f} min"
-    summary = (f"{len(train)} epizodów treningowych  ·  {n_fin} ukończonych  ·  "
-               f"najlepszy czas {best_all / 1000:.2f} s" if best_all else
-               f"{len(train)} epizodów treningowych  ·  brak ukończonych")
-    fig.suptitle("Q(λ) – przebieg treningu", x=0.01, ha="left", fontsize=15, color=INK, fontweight="bold")
-    fig.text(0.01, 0.955, f"{summary}  ·  czas treningu {duration}", ha="left", fontsize=10, color=INK_2)
+    steps = int(train[-1]["total_steps"]) if train else 0
+    summary = (f"{len(train)} epizodów treningowych ({steps:,} kroków)  ·  {n_fin} ukończonych  ·  "
+               + (f"najlepszy czas {best_all / 1000:.2f} s" if best_all else "brak ukończonych"))
+    fig.suptitle("Przebieg treningu", x=0.01, y=0.995, ha="left", va="top", fontsize=15, color=INK,
+                 fontweight="bold")
+    fig.text(0.01, 0.975, f"{summary}  ·  czas treningu {duration}", ha="left", va="top", fontsize=10,
+             color=INK_2)
 
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=120, facecolor=SURFACE)
+    fig.savefig(out_path, dpi=110, facecolor=SURFACE)
     plt.close(fig)
     return out_path
