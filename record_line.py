@@ -1,60 +1,86 @@
 """
-Nagrywa linię referencyjną trasy: przejedź mapę sam (albo puść replay/TAS w TMInterface),
-a skrypt co ~1 m zapisze pozycję auta. Po przekroczeniu mety zapisuje reference_line.npy.
+Nagrywa linię referencyjną trasy (TMInterface 2 + wtyczka RL Bridge): przejedź mapę sam,
+a skrypt co ~1 m zapisze pozycję auta. Po przekroczeniu mety zapisuje linię do katalogu mapy
+(maps/<mapa>/reference_line.npy). Zwykle uruchamiane z menu: python train_qlearning.py
 
-    python record_line.py [plik_wyjściowy.npy]
+    python record_line.py [port]
 """
 
+from __future__ import annotations
+
 import sys
-import time
+from pathlib import Path
 
 import numpy as np
-from tminterface.client import Client
-from tminterface.interface import TMInterface
+
+from tmi2_bridge import TMI2Bridge
 
 
-class Recorder(Client):
-    def __init__(self, out_path: str):
-        super().__init__()
-        self.out_path = out_path
-        self.points = []
-        self.done = False
+def record_line(bridge: TMI2Bridge, out_path: Path) -> bool:
+    """Nagrywa jeden przejazd do mety. Zwraca True, jeśli zapisano linię. Ctrl+C przerywa."""
+    bridge.set_speed(1.0)
+    bridge.set_period(10)      # stan co tick; gra czeka na odpowiedź, ale lokalnie to ułamek ms
+    bridge.set_active(True)
+    print("Restartuję wyścig - po odliczaniu jedź do mety. Restart w trakcie (Delete) = nagrywanie od nowa. "
+          "Ctrl+C = anuluj.")
 
-    def on_registered(self, iface: TMInterface) -> None:
-        print(f"Połączono z {iface.server_name}. Zrestartuj wyścig (Delete) i jedź do mety.")
+    points: list[np.ndarray] = []
+    restarted = False
+    try:
+        while True:
+            msg = bridge.recv()
+            if msg[0] == "cp":
+                _, current, target = msg
+                if current > 0:
+                    print(f"Checkpoint {current}/{target}")
+                if target > 0 and current == target and len(points) > 1:
+                    pts = np.array(points)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    np.save(out_path, pts)
+                    length = np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()
+                    print(f"Zapisano {len(pts)} punktów ({length:.0f} m) do {out_path}")
+                    return True
+                continue
 
-    def on_run_step(self, iface: TMInterface, _time: int) -> None:
-        if _time < 0:
-            if self.points:  # restart w trakcie nagrywania -> zaczynamy od nowa
-                print("Restart - nagrywam od nowa")
-                self.points = []
-            return
-        pos = np.array(iface.get_simulation_state().position)
-        if not self.points or np.linalg.norm(pos - self.points[-1]) >= 1.0:
-            self.points.append(pos)
-
-    def on_checkpoint_count_changed(self, iface: TMInterface, current: int, target: int) -> None:
-        print(f"Checkpoint {current}/{target}")
-        if current == target and not self.done:
-            pts = np.array(self.points)
-            np.save(self.out_path, pts)
-            length = np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()
-            print(f"Zapisano {len(pts)} punktów ({length:.0f} m) do {self.out_path}")
-            self.done = True
+            _, t, state = msg
+            if not restarted:
+                bridge.give_up()    # zaczynamy zawsze od startu, niezależnie od tego, gdzie stoi auto
+                restarted = True
+                continue
+            if t < 0:
+                if points:
+                    print("Restart - nagrywam od nowa")
+                    points = []
+            else:
+                pos = np.array(state.position, dtype=np.float64)
+                if not points or np.linalg.norm(pos - points[-1]) >= 1.0:
+                    points.append(pos)
+            bridge.cont()       # nie zmieniamy wejść - jedziesz ty
+    except KeyboardInterrupt:
+        print("Anulowano - linia nie została zapisana.")
+        raise
+    finally:
+        if bridge.connected:
+            bridge.deactivate()
 
 
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else "reference_line.npy"
-    iface = TMInterface("TMInterface0")
-    rec = Recorder(out)
-    iface.register(rec)
+    from maps import MapStore
+
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8478
+    bridge = TMI2Bridge(port=port)
+    bridge.connect()
     try:
-        while not rec.done:
-            time.sleep(0.1)
+        info = bridge.get_map_info()
+        if not info.loaded:
+            print("W grze nie jest załadowana żadna mapa.")
+            return
+        print(f"Mapa: {info.name} ({info.uid})")
+        record_line(bridge, MapStore().line_path(info))
     except KeyboardInterrupt:
         pass
     finally:
-        iface.close()
+        bridge.close()
 
 
 if __name__ == "__main__":
