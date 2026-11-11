@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Środowisko wirtualne
+.venv/
+venv/
+
+# Wyniki treningu
+models/
+logs/
+*.zip
+
+# Edytor / system
+.idea/
+.vscode/*
+!.vscode/settings.json
+Thumbs.db
+.DS_Store
