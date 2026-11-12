@@ -41,7 +41,21 @@ class EnvConfig:
     reference_line: str | None = "reference_line.npy"
     max_deviation_m: float = 30.0       # koniec epizodu, gdy auto odjedzie tak daleko od linii (w poziomie)
     max_vertical_deviation_m: float = 40.0  # ...albo tyle w pionie (spadnięcie z podwyższenia); skoki są OK
+    max_airborne_deviation_m: float = 50.0  # limit w poziomie, gdy żadne koło nie dotyka ziemi (skok): szybki agent
+                                            # leci inaczej niż linia; po wylądowaniu znów obowiązuje max_deviation_m
     lookahead_m: tuple = (10, 20, 30, 50, 80)  # punkty linii przed autem podawane w obserwacji
+    lookahead_height: bool = True       # czy podawać też wysokość tych punktów (zjazdy, podjazdy, skocznie)
+    # Dodatkowe wejścia sieci (jak w popularnych agentach TM): przyspieszenie, poślizg kół, kontakt ze ścianą,
+    # kąt do linii, strona linii (odległość ze znakiem) i krzywizna trasy przed autem. False = stara obserwacja.
+    extra_inputs: bool = True
+    curvature_at_m: tuple = (10, 30, 60, 100, 150)   # gdzie mierzyć krzywiznę trasy przed autem
+    progress_reward_per_m: float = 0.1  # nagroda za każdy metr postępu wzdłuż linii (główna nagroda)
+    time_penalty_per_s: float = 0.0     # kara za każdą sekundę jazdy (zachęta do szybszego dojazdu)
+    # Kara za uderzenie w ścianę/bandę: gwałtowny spadek prędkości poziomej w jednym kroku. Hamulec
+    # zwalnia o kilka km/h na 50 ms, zderzenie o kilkadziesiąt. Liczymy prędkość poziomą, bo przy
+    # lądowaniu po skoku znika tylko prędkość pionowa i to nie jest błąd.
+    hit_speed_loss_kmh: float = 10.0    # spadek większy niż tyle km/h w jednym kroku = uderzenie
+    hit_penalty_per_kmh: float = 0.0    # kara za każdy km/h utracony ponad próg (0 = wyłączone)
     checkpoint_bonus: float = 10.0
     finish_bonus: float = 100.0
     crash_penalty: float = -10.0
@@ -114,8 +128,14 @@ class ReferenceLine:
 #   potem dla każdej odległości z lookahead_m: bok / 100, przód / 100, wysokość / 50 punktu linii
 #           przed autem względem auta [m]
 #   [-1]    odległość od linii w poziomie / max_deviation_m
+# Przy extra_inputs=True dodatkowo (na końcu):
+#   przyspieszenie w układzie auta (bok, przód) / 50 [m/s^2], poślizg kół (4 x 0/1), kontakt boczny ze ścianą (0/1),
+#   odległość od linii ZE ZNAKIEM (po której stronie) / max_deviation_m, kąt do kierunku linii: sin, cos,
+#   krzywizna linii w odległościach curvature_at_m: zmiana kierunku trasy na 20 m [rad] (znak = lewo/prawo)
 OBS_BASE_DIM = 16
 OBS_PER_LOOKAHEAD = 3
+OBS_EXTRA_CAR = 2 + 4 + 1
+OBS_EXTRA_LINE = 1 + 2
 
 
 def actions_to_script(action_log: list) -> str:
@@ -162,7 +182,10 @@ class TrackmaniaEnv(gym.Env):
         else:
             print("[ENV] Brak linii referencyjnej -> nagroda za prędkość (nagraj ją: python record_line.py)")
 
-        obs_dim = OBS_BASE_DIM + ((OBS_PER_LOOKAHEAD * len(self.cfg.lookahead_m) + 1) if self.line else 0)
+        per_point = OBS_PER_LOOKAHEAD if self.cfg.lookahead_height else OBS_PER_LOOKAHEAD - 1
+        obs_dim = OBS_BASE_DIM + ((per_point * len(self.cfg.lookahead_m) + 1) if self.line else 0)
+        if self.cfg.extra_inputs:
+            obs_dim += OBS_EXTRA_CAR + ((OBS_EXTRA_LINE + len(self.cfg.curvature_at_m)) if self.line else 0)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
         if continuous:
             self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)  # steer, gas
@@ -271,11 +294,51 @@ class TrackmaniaEnv(gym.Env):
         self.best_progress = 0.0
         self.best_progress_t = 0
         self.stuck_ms = 0
+        self.hits = 0                  # liczba uderzeń (gwałtownych spadków prędkości) w epizodzie
+        self._last_local_v = None       # do przyspieszenia
+        self._last_hspeed = None
         self.action_log: list = []     # (race_time, (gas, brake, left, right)) dla skryptu powtórki
         self._last_t = 0
         self._last_keys = DISCRETE_ACTIONS[0]
         if self.line:
             self.line.reset()
+
+    def _extra_inputs(self, state, vel, yaw, pos, progress) -> list[float]:
+        dt = 0.01 * self.cfg.action_repeat
+        local_v = _to_local(vel, yaw)
+        acc = np.zeros(3) if self._last_local_v is None else (local_v - self._last_local_v) / dt
+        self._last_local_v = local_v
+        out = [acc[0] / 50.0, acc[2] / 50.0]                 # przyspieszenie: bok, przód
+        out += self._read_flags(state)                        # poślizg 4 kół + kontakt ze ścianą
+        if self.line:
+            line = self.line
+            here = line.point_at(progress)
+            tangent = line.point_at(progress + 2.0) - line.point_at(progress - 2.0)
+            diff = pos - here
+            norm = math.hypot(tangent[0], tangent[2]) or 1.0
+            signed = (tangent[0] * diff[2] - tangent[2] * diff[0]) / norm   # >0 = jedna strona linii, <0 = druga
+            out.append(signed / self.cfg.max_deviation_m)
+            side, _, fwd = _to_local(tangent, yaw)            # kierunek linii widziany z auta
+            ang = math.atan2(side, fwd)
+            out += [math.sin(ang), math.cos(ang)]
+            for d in self.cfg.curvature_at_m:
+                a1 = line.point_at(progress + d) - line.point_at(progress + d - 10.0)
+                a2 = line.point_at(progress + d + 10.0) - line.point_at(progress + d)
+                h1, h2 = math.atan2(a1[0], a1[2]), math.atan2(a2[0], a2[2])
+                out.append(((h2 - h1 + math.pi) % (2 * math.pi)) - math.pi)
+        return out
+
+    def _read_flags(self, state) -> list[float]:
+        """Poślizg kół i kontakt boczny auta (ze ścianą/bandą) ze stanu symulacji."""
+        try:
+            sliding = [float(w.real_time_state.is_sliding) for w in state.simulation_wheels]
+            wall = float(state.scene_mobil.has_any_lateral_contact)
+            return sliding + [wall]
+        except Exception as e:   # noqa: BLE001
+            if not getattr(self, "_flags_warned", False):
+                print(f"[ENV] Uwaga: nie da się odczytać poślizgu/kontaktu ze ścianą ({type(e).__name__}: {e}) - wstawiam 0")
+                self._flags_warned = True
+            return [0.0] * 5
 
     def _evaluate(self, state, t: int, first: bool = False):
         self._last_t = t
@@ -283,11 +346,17 @@ class TrackmaniaEnv(gym.Env):
         vel = np.array(state.velocity, dtype=np.float64)
         yaw, pitch, roll = state.yaw_pitch_roll
         speed_kmh = np.linalg.norm(vel) * 3.6
+        hspeed_kmh = math.hypot(vel[0], vel[2]) * 3.6
 
         try:
             wheels = [float(w.real_time_state.has_ground_contact) for w in state.simulation_wheels]
-        except Exception:
+            airborne = not any(wheels)
+        except Exception as e:  # noqa: BLE001
+            if not getattr(self, "_wheels_warned", False):
+                print(f"[ENV] Uwaga: nie da się odczytać kontaktu kół ({type(e).__name__}: {e}) - wstawiam 0")
+                self._wheels_warned = True
             wheels = [0.0, 0.0, 0.0, 0.0]
+            airborne = False    # brak danych o kołach -> zwykły limit odchylenia
 
         try:
             ang = np.array(state.dyna.current_state.angular_speed, dtype=np.float64)
@@ -309,19 +378,30 @@ class TrackmaniaEnv(gym.Env):
             for d in self.cfg.lookahead_m:
                 side, up, fwd = _to_local(self.line.point_at(progress + d) - pos, yaw)
                 # (bok, przód) - zakręty; wysokość - zjazdy, podjazdy, skocznie przed autem
-                obs.extend((side / 100.0, fwd / 100.0, up / 50.0))
+                obs.extend((side / 100.0, fwd / 100.0, up / 50.0) if self.cfg.lookahead_height
+                           else (side / 100.0, fwd / 100.0))
             obs.append(dist_from_line / self.cfg.max_deviation_m)
+        if self.cfg.extra_inputs:
+            obs.extend(self._extra_inputs(state, vel, yaw, pos, progress))
         obs = np.asarray(obs, dtype=np.float32)
 
         # --- nagroda ---
         dt_ms = 10 * self.cfg.action_repeat
         if self.line:
-            reward = (progress - self.last_progress) / 10.0   # ~ +1 za każde 10 m postępu
+            reward = (progress - self.last_progress) * self.cfg.progress_reward_per_m
             self.last_progress = progress
+            if not first:
+                reward -= self.cfg.time_penalty_per_s * dt_ms / 1000.0
         else:
             reward = speed_kmh / 100.0 * dt_ms / 1000.0
         reward += self.new_cps * self.cfg.checkpoint_bonus
         self.new_cps = 0
+        if not first and self._last_hspeed is not None:
+            loss = self._last_hspeed - hspeed_kmh
+            if loss > self.cfg.hit_speed_loss_kmh:
+                self.hits += 1
+                reward -= self.cfg.hit_penalty_per_kmh * (loss - self.cfg.hit_speed_loss_kmh)
+        self._last_hspeed = hspeed_kmh
 
         # --- koniec epizodu ---
         terminated = truncated = False
@@ -345,7 +425,8 @@ class TrackmaniaEnv(gym.Env):
             elif pos[1] < self.cfg.min_height:
                 terminated, reason = True, "fell"
                 reward += self.cfg.crash_penalty
-            elif self.line and (dist_from_line > self.cfg.max_deviation_m
+            elif self.line and (dist_from_line > (self.cfg.max_airborne_deviation_m if airborne
+                                                  else self.cfg.max_deviation_m)
                                 or vert_from_line > self.cfg.max_vertical_deviation_m):
                 terminated, reason = True, "off_track"
                 reward += self.cfg.crash_penalty
@@ -359,7 +440,7 @@ class TrackmaniaEnv(gym.Env):
                 truncated, reason = True, "timeout"
 
         info = {"race_time": t, "speed_kmh": speed_kmh, "checkpoints": self.cp_count,
-                "progress_m": progress, "reason": reason}
+                "progress_m": progress, "reason": reason, "hits": self.hits}
         return obs, float(reward), terminated, truncated, info
 
 

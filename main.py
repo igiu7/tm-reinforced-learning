@@ -190,11 +190,14 @@ class App:
         except KeyboardInterrupt:
             print("\nPrzerwano natychmiast - łączę się z grą od nowa.")
             self.drop_connection()
-        except (BridgeError, OSError) as e:
+        except (BridgeError, ConnectionError) as e:
             print(f"\nUtracono połączenie z grą: {e}")
             self.drop_connection()
+        except OSError as e:
+            print(f"\nBłąd zapisu/odczytu pliku: {type(e).__name__}: {e}")
+            self.drop_connection()
         except (RuntimeError, ValueError) as e:
-            print(f"\nBłąd: {e}")
+            print(f"\nBłąd: {type(e).__name__}: {e}")
             if env is not None:
                 env.close()
         else:

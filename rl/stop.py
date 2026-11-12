@@ -15,7 +15,7 @@ class GracefulStop:
         if self.requested:
             raise KeyboardInterrupt
         self.requested = True
-        print(f"\n[QL] {self.message}")
+        print(f"\n[RL] Otrzymano Ctrl+C. {self.message}")
 
     def __enter__(self):
         self.requested = False

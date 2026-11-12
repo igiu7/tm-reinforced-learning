@@ -26,17 +26,38 @@ class Agent(ABC):
         self.n_actions = n_actions
         self.cfg = cfg
         self.rng = np.random.default_rng(seed)
+        self.random_action_probs: np.ndarray | None = None   # rozkład losowych akcji (None = równomierny)
+
+    def set_random_action_probs(self, weights) -> None:
+        """Wagi losowania akcji przy eksploracji (np. gaz częściej niż hamulec). Normalizowane do 1."""
+        w = np.asarray(weights, dtype=np.float64)
+        if len(w) != self.n_actions or (w < 0).any() or w.sum() <= 0:
+            raise ValueError(f"Wagi losowych akcji {list(w)} nie pasują do {self.n_actions} akcji")
+        self.random_action_probs = w / w.sum()
+
+    def random_action(self) -> int:
+        return int(self.rng.choice(self.n_actions, p=self.random_action_probs))
 
     # --- decyzje i nauka ----------------------------------------------------
     @abstractmethod
-    def act(self, obs: np.ndarray, explore: bool) -> int:
-        """Indeks akcji. explore=False -> polityka zachłanna (przejazdy testowe, jazda)."""
+    def act(self, obs: np.ndarray, explore: bool, epsilon: float | None = None) -> int:
+        """Indeks akcji. explore=False -> polityka zachłanna (przejazdy testowe, jazda).
+        epsilon: nadpisuje własny poziom eksploracji agenta (np. rl/exploration.py w strefie porażki)."""
+
+    @property
+    def epsilon(self) -> float:
+        """Bieżący (własny) poziom eksploracji agenta; 0 dla agentów bez epsilon-greedy."""
+        return 0.0
 
     @abstractmethod
     def observe(self, obs: np.ndarray, action: int, reward: float, next_obs: np.ndarray,
                 terminated: bool, truncated: bool) -> None:
         """Jedno przejście środowiska w trakcie treningu. terminated = stan terminalny (bez bootstrapu),
         truncated = przerwanie z zewnątrz (limit czasu) - wartość dalszej jazdy nadal się liczy."""
+
+    def add_elite(self, transitions) -> None:
+        """Przejazd sekcji, który pobił jej najlepszy czas (rl/sections.py) - agent może go zapamiętać na stałe.
+        Domyślnie nic nie robi (agenci bez pamięci powtórek)."""
 
     def start_episode(self) -> None:
         pass

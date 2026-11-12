@@ -26,6 +26,11 @@ class ReplayBuffer:
         self.actions = np.zeros(capacity, dtype=np.int64)
         self.returns = np.zeros(capacity, dtype=np.float32)    # suma zdyskontowanych nagród z n kroków
         self.discounts = np.zeros(capacity, dtype=np.float32)  # g^k dla bootstrapu (0, gdy stan terminalny)
+        # pojedyncze nagrody z n kroków, ich liczba i czy next_obs jest końcem epizodu - potrzebne
+        # mini-wyścigom (rl/agents/dqn.py), które składają zwrot dopiero przy losowaniu
+        self.step_rewards = np.zeros((capacity, self.n_step), dtype=np.float32)
+        self.n_steps = np.zeros(capacity, dtype=np.int16)
+        self.terminal = np.zeros(capacity, dtype=bool)
         self.pos = 0
         self.size = 0
         self._pending: deque = deque()   # ostatnie kroki czekające na złożenie n-krokowego zwrotu
@@ -48,7 +53,8 @@ class ReplayBuffer:
 
     def _store_front(self, next_obs, terminated: bool) -> None:
         ret, g = 0.0, 1.0
-        for _, _, r in self._pending:
+        rewards = [r for _, _, r in self._pending]
+        for r in rewards:
             ret += g * r
             g *= self.gamma
         obs, action, _ = self._pending.popleft()
@@ -56,13 +62,17 @@ class ReplayBuffer:
         self.obs[i], self.actions[i], self.returns[i] = obs, action, ret
         self.next_obs[i] = next_obs
         self.discounts[i] = 0.0 if terminated else g
+        self.step_rewards[i] = 0.0
+        self.step_rewards[i, :len(rewards)] = rewards
+        self.n_steps[i] = len(rewards)
+        self.terminal[i] = terminated
         self.pos = (self.pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
     # --- próbkowanie ------------------------------------------------------------
     def sample(self, batch_size: int):
         idx = self.rng.integers(0, self.size, size=batch_size)
-        return (self.obs[idx], self.actions[idx], self.returns[idx], self.next_obs[idx], self.discounts[idx])
+        return (self.obs[idx], self.actions[idx], self.returns[idx], self.next_obs[idx], self.discounts[idx], idx)
 
     # --- zapis / odczyt (żeby wznowiony trening nie zaczynał z pustą pamięcią) ----------------
     def save(self, path: Path) -> None:
@@ -71,17 +81,20 @@ class ReplayBuffer:
         # zapisujemy w kolejności od najstarszego, żeby po wczytaniu nadpisywanie szło jak wcześniej
         order = np.arange(self.pos - n, self.pos) % self.capacity if n == self.capacity else np.arange(n)
         np.savez(tmp, obs=self.obs[order], next_obs=self.next_obs[order], actions=self.actions[order],
-                 returns=self.returns[order], discounts=self.discounts[order])
+                 returns=self.returns[order], discounts=self.discounts[order],
+                 step_rewards=self.step_rewards[order], n_steps=self.n_steps[order], terminal=self.terminal[order])
         tmp.replace(path)
 
     def load(self, path: Path) -> bool:
         data = np.load(path)
-        if data["obs"].shape[1] != self.obs.shape[1]:
-            return False
+        if data["obs"].shape[1] != self.obs.shape[1] or "step_rewards" not in data.files                 or data["step_rewards"].shape[1] != self.n_step:
+            return False   # bufor z innej wersji programu / innego n_step - zaczynamy z pustym
         n = min(len(data["obs"]), self.capacity)
         sl = slice(len(data["obs"]) - n, None)   # przy mniejszym buforze bierzemy najnowsze
         self.obs[:n], self.next_obs[:n] = data["obs"][sl], data["next_obs"][sl]
         self.actions[:n], self.returns[:n], self.discounts[:n] = data["actions"][sl], data["returns"][sl], data["discounts"][sl]
+        self.step_rewards[:n], self.n_steps[:n], self.terminal[:n] = (data["step_rewards"][sl], data["n_steps"][sl],
+                                                                    data["terminal"][sl])
         self.size, self.pos = n, n % self.capacity
         return True
 

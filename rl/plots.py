@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
 import matplotlib
@@ -35,6 +37,22 @@ def _moving_avg(y: np.ndarray, w: int) -> np.ndarray:
         cnt = n[i + 1] - n[lo]
         if cnt > 0:
             out[i] = (c[i + 1] - c[lo]) / cnt
+    return out
+
+
+def _read_sections(path: Path) -> list[dict]:
+    """sections.csv -> [{"episode", "mode", "times": [ms albo nan, ...]}]."""
+    if not path.exists():
+        return []
+    import csv
+    with path.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    out = []
+    for r in rows[1:]:
+        if len(r) < 3:
+            continue
+        out.append({"episode": int(r[0]), "mode": r[1],
+                    "times": [float(v) if v else np.nan for v in r[2:]]})
     return out
 
 
@@ -79,8 +97,9 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20, where_last: 
     ep = col(train, "episode")
     ev_ep = col(evals, "episode") if evals else np.array([])
 
-    fig = plt.figure(figsize=(15, 20), facecolor=SURFACE)
-    gs = fig.add_gridspec(5, 2)
+    sec_rows = _read_sections(csv_path.with_name("sections.csv"))
+    fig = plt.figure(figsize=(15, 24 if sec_rows else 20), facecolor=SURFACE)
+    gs = fig.add_gridspec(6 if sec_rows else 5, 2)
     ax_time, ax_prog = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
     ax_rew, ax_reason = fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])
     ax_speed, ax_eps = fig.add_subplot(gs[2, 0]), fig.add_subplot(gs[2, 1])
@@ -152,8 +171,14 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20, where_last: 
 
     # --- 6. eksploracja --------------------------------------------------------
     _style(ax_eps, "Eksploracja: udział losowych akcji (epsilon)", "epsilon")
-    ax_eps.plot(ep, col(train, "epsilon"), color=SERIES[0], linewidth=2)
+    zone_on = ~np.isnan(col(train, "zone_start_pct"))
+    if zone_on.any():
+        # pasy w tle = epizody, w których działała dodatkowa eksploracja w strefie porażki
+        ax_eps.fill_between(ep, 0, 1.02, where=zone_on, step="mid", color=SERIES[3], alpha=0.25,
+                            linewidth=0, label="aktywna strefa eksploracji")
+    ax_eps.plot(ep, col(train, "epsilon"), color=SERIES[0], linewidth=2, label="epsilon (harmonogram)")
     ax_eps.set_ylim(0, 1.02)
+    _legend(ax_eps, loc="upper right")
 
     # --- 7. strata uczenia -----------------------------------------------------
     loss = col(train, "loss")
@@ -190,10 +215,37 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20, where_last: 
             ax_where.bar(edges[:-1], counts, width=2.5, bottom=bottom, align="edge", color=color,
                          edgecolor=SURFACE, linewidth=1, label=REASON_LABELS[k])
             bottom += counts
+        last_zone = [(r["zone_start_pct"], r["zone_end_pct"]) for r in train
+                     if r["episode"] > ep.max() - where_last and not np.isnan(r["zone_start_pct"])]
+        if last_zone:
+            z0, z1 = last_zone[-1]
+            ax_where.axvspan(z0, z1, color=SERIES[3], alpha=0.18, linewidth=0,
+                             label=f"ostatnia strefa eksploracji ({z0:.0f}-{z1:.0f}%)")
         ax_where.set_xlim(0, 100)
         _legend(ax_where, loc="upper left")
     else:
         _no_data(ax_where, "Brak nieudanych przejazdów w tym okresie")
+
+    # --- 10. czasy sekcji ------------------------------------------------------
+    if sec_rows:
+        ax_sec = fig.add_subplot(gs[5, :])
+        _style(ax_sec, "Czas sekcji toru: najlepszy i typowy z ostatnich 50 przejazdów treningowych",
+               "czas sekcji [s]", xlabel="sekcja")
+        n_sec = len(sec_rows[0]["times"])
+        best = np.array([np.nanmin([r["times"][k] for r in sec_rows] + [np.nan]) for k in range(n_sec)]) / 1000
+        last = [r for r in sec_rows if r["mode"] == "train"][-50:]
+        med = np.array([np.nanmedian([r["times"][k] for r in last] + [np.nan]) if last else np.nan
+                        for k in range(n_sec)]) / 1000
+        x = np.arange(1, n_sec + 1)
+        ax_sec.bar(x - 0.2, best, width=0.38, color=SERIES[2], edgecolor=SURFACE, linewidth=1, label="najlepszy")
+        ax_sec.bar(x + 0.2, med, width=0.38, color=SERIES[0], edgecolor=SURFACE, linewidth=1,
+                   label="mediana ostatnich 50")
+        for xi, b, m in zip(x, best, med):
+            if not np.isnan(b) and not np.isnan(m) and b > 0:
+                ax_sec.annotate(f"+{(m - b) / b * 100:.0f}%", (xi + 0.2, m), xytext=(0, 3), textcoords="offset points",
+                                ha="center", fontsize=8, color=INK_2)
+        ax_sec.set_xticks(x)
+        _legend(ax_sec, loc="upper right")
 
     # --- podsumowanie ----------------------------------------------------------
     n_fin = sum(r["finished"] for r in train)
@@ -210,6 +262,19 @@ def plot_training(csv_path: Path, out_path: Path, window: int = 20, where_last: 
 
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=110, facecolor=SURFACE)
-    plt.close(fig)
+    # Zapis do pliku tymczasowego i podmiana: na Windows przeglądarka zdjęć, w której wykres jest otwarty,
+    # potrafi chwilowo blokować plik - wtedy próbujemy jeszcze kilka razy.
+    tmp = out_path.with_name(out_path.stem + ".tmp.png")
+    try:
+        fig.savefig(tmp, dpi=110, facecolor=SURFACE)
+    finally:
+        plt.close(fig)
+    for attempt in range(5):
+        try:
+            os.replace(tmp, out_path)
+            return out_path
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.2)
     return out_path
